@@ -45,7 +45,7 @@ struct Token {
 };
 
 // Express read/write interest on a file descriptor
-enum Interests {
+enum Interest {
   Readable = 0x01,
   Writable = 0x02
 };
@@ -69,6 +69,18 @@ public:
   // Retrieve the token associated with this event
   Token get_token() {
     return Token{ (std::size_t)_kevent.udata };
+  }
+
+  // Retireve the specific readiness interests to the underlying IO source
+  Interest get_interest() {
+    switch (_kevent.filter) {
+      case EVFILT_READ:
+        return Interest::Readable;
+      case EVFILT_WRITE:
+        return Interest::Writable;
+      default:
+        throw async::AsyncException("only support read/write interests right now");
+    }
   }
 
 private:
@@ -132,7 +144,7 @@ public:
   // Register events for given file descriptor
   //
   // `token` is used as an identifier to the events as the output of poll
-  void register_event(int fd, Token token, Interests interests) {
+  void register_event(int fd, Token token, Interest interests) {
     uint32_t flags = EV_CLEAR | EV_RECEIPT | EV_ADD;
 
     // Might need two Event's for both readable/writable interest
@@ -140,11 +152,11 @@ public:
     auto n_changes = 0;
 
     // add event for readable/writable
-    if (interests & Interests::Readable) {
+    if (interests & Interest::Readable) {
       changes[n_changes] = Event(fd, EVFILT_READ, flags, token);
       n_changes++;
     }
-    if (interests & Interests::Writable) {
+    if (interests & Interest::Writable) {
       changes[n_changes] = Event(fd, EVFILT_WRITE, flags, token);
       n_changes++;
     }
@@ -179,6 +191,9 @@ private:
   int _kq;
 };
 
+// Foreward declaration of a wrapper classs that wraps
+class PollEvented;
+
 }; // ns selector
 }; // ns async
 
@@ -206,7 +221,8 @@ namespace async {
 namespace future {
 
 // Function pointer type for waker function--a no-arg function that wakes up the task
-using WakerFn = void (*)();
+//using WakerFn = void (*)();
+using WakerFn = std::function<void()>;
 
 // Holds information for future's parent task. Currently just holds waker to queue task
 // back to executor
@@ -250,17 +266,22 @@ namespace task {
 // Type information present with the actual value. AKA when poll returns Ready(value),
 // where is that value going to go? right now it just gets lost in poll()
 
+class _Core {
+public:
+  virtual void poll(future::Context ctx) = 0;
+};
+
 /// Holds the underlying future. This class is type-erased and held behind a generic
 /// pointer, so operations to the underlying future are executed through this interface
 ///
 /// Kind of acts as a vtable
 template <class F>
-class Core {
+class Core : public _Core {
 public:
   Core(F fut) : _fut(fut) { }
 
-  void poll(future::WakerFn wake) {
-    auto res = _fut.poll(wake);
+  void poll(future::Context ctx) {
+    auto res = _fut.poll(ctx);
 
     // if future has completed
     if (res.index() == 0) {
@@ -280,6 +301,15 @@ private:
 // Wraps a future, while also driving...
 class Task {
 public:
+
+  // TODO: need some API that returns a handle or something that implements the Future
+  // trait, bedause a Task itself needs to be awaitable
+
+  // TODO: technically all of this Core stuff right now can just be done through a simple
+  // function pointer that Task holds on, and creates on the constructor. I guess the main
+  // advantage of having a dedicated class is that there can be multiple methods (more
+  // than just poll)
+
   // Create a task from a future.
   //
   // The passed in future must inherit from future::Future. Task holds onto a pointer to
@@ -293,6 +323,11 @@ public:
     _core_ptr = (void *)c;
   }
 
+  // Polls underlying future
+  void poll(future::Context ctx) {
+    ((_Core *)_core_ptr)->poll(ctx);
+  }
+
 private:
   // A pointer to the Core holding the future
   void *_core_ptr;
@@ -304,13 +339,39 @@ private:
 ///
 namespace executor {
 
+// Maintains state on the wakers for a given event source
+class ScheduledIo {
+public:
+  void add() {}
+
+  // Loops through the wakers, only waking those with the given interest
+  void wake(selector::Interest interest) {
+  }
+
+private:
+  // TODO: you need to add more information besides just the waker, for example the
+  // interest this waker is for (read or write), because there can be multiple tasks
+  // waiting on a source but for different readiness events
+  std::vector<future::Context> _wakers;
+};
+
+// Responsible for monitoring IO events and waking the respective tasks
 class IODriver {
 public:
-  IODriver() { }
-
   // block on the poll for IO events until an event occurs, or the timeout runs out,
   // whichever comes first.
   void turn(std::optional<std::chrono::nanoseconds> timeout) {
+    // wait for events to occur
+    auto num_events = _p.poll(_events, timeout);
+
+    for (auto i = 0u; i < num_events; i++) {
+      // call the waker associated with this event
+      auto tok = _events.events[i].get_token();
+      auto interest = _events.events[i].get_interest();
+      if (_resources.find(tok) != _resources.end()) {
+        _resources[tok].wake(interest);
+      }
+    }
   }
 
 private:
@@ -321,19 +382,14 @@ private:
   selector::Poll _p;
 
   // Map from tokens to wakers
-  std::unordered_map<selector::Token, future::WakerFn> _scheduled_io;
+  std::unordered_map<selector::Token, ScheduledIo> _resources;
 };
 
-enum ExecutorType {
-  MULTI_THREAD,
-  SINGLE_THREAD,
-};
-
-template <ExecutorType>
-class Executor;
-
-template<>
-class Executor<ExecutorType::SINGLE_THREAD> {
+// The executor is responsible for driving all the tasks and futures to completion. It can
+// be run on both a single threaded or multiple threads
+//
+// CURRENTLY SINGLE THREAD IMPLEMENTATION
+class Executor {
 public:
   // Create the executor
   Executor() { }
@@ -348,21 +404,62 @@ public:
     _tq.push_back(std::make_shared(fut));
 
     // drive tasks to completion, polling on them
-    while (true) {
+    run();
+  }
+
+  // Run event loop, driving tasks to completion
+  void run() {
+    while (!_tq.empty()) {
+      // take next task and poll it
+      auto t = _tq.front(); _tq.pop_front();
+
+      // create contex from waker that adds this task back to the queue
+      future::WakerFn waker = [&]() {
+        _tq.push_back(t);
+      };
+
+      t->poll(future::Context { waker });
     }
   }
 
 private:
-  // The future task queue, guarded by a mutex for read/writes
-  std::mutex _tq_guard;
+  // The future task queue--unguraded by any sync mechanism because this executor should
+  // be purely single threaded
   std::deque<std::shared_ptr<task::Task>> _tq;
-};
 
-template <>
-class Executor<ExecutorType::MULTI_THREAD> {
+  // An IO driver to monitor events
+  IODriver _io_driver;
 };
 
 }; // ns executor
+
+
+//
+namespace selector {
+
+// TODO: okay so the way this needs to go down is you probs need some generic wrapper over
+// different types of IO sources (tcp, udp, files, pipes, etc.), PollEvented is just what
+// Tokio uses/calls but doesn't have to be like this. Either way though this wrapper
+// structure should probs be generic over some event source, and also it should have a
+// reference to the current IODriver. This way in the IODriver you can register this event
+// in the Poll, and also add a waker to the corresponding ScheduledIO that wakes up this
+// task. On that note, you probs need a way to get the current task? Might be as simple as
+// ever over-arching task makes a waker that wakes itself up, then it passes this waker to
+// all the futures it polls, which is thus also passed to this PollEvented thing
+//
+// TODO: one thing I just realized that is not resolved from the thing above is how to
+// properly generate a token for an event. You can't just make a random one because then
+// you can't have one token map to multiple wakers, which must be done (multiple diff
+// people might be waiting on a single event). I don't see an easy way to get the token
+// for an event (unless we are very roundabout and have a map from FD -> token) or
+// something but that just seems wrong. It seems like Tokio does some scheme based on the
+// driver tick, generation, etc. but need to investigate more.
+class PollEvented {
+
+private:
+};
+
+}; // ns selector
 
 }; // ns async
 
