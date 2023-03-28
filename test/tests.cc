@@ -1,6 +1,7 @@
 #include "async.h"
 
 #include <iostream>
+#include <mutex>
 #include <thread>
 #include <chrono>
 
@@ -32,7 +33,7 @@ void test_pipe() {
 
   // register readability event with read-end of pipe
   Token tok = { 1 };
-  p.register_event(fds[0], tok, Interests::Readable);
+  p.register_event(fds[0], tok, Interest::Readable);
 
   // spawn a thread that waits and writes to pipe
   std::thread t([&] {
@@ -62,28 +63,61 @@ void test_socket() {
 
 }; // ns selector
 
+namespace executor {
+
+// TODO(3/25): make this a working example, also the next thing to do is integrate sources
+// with the IODriver so that the runtime is actually aware of the sources of IO that the
+// tasks depend on
+class OneSecondTimer : public async::future::Future<void> {
+public:
+  OneSecondTimer() : _timer_finished(false) {
+    // spawn a thread that sleeps for a second and wakes this future up. sets the boolean
+    // flag to true.
+    std::thread t([this]() {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(1000000000));
+
+        std::lock_guard<std::mutex> guard(_m);
+        _timer_finished = true;
+        if (_waker != nullptr) {
+          _waker();
+        }
+    });
+  }
+
+  OneSecondTimer(OneSecondTimer &&other) {
+    std::lock_guard<std::mutex> guard(other._m);
+    _timer_finished = other._timer_finished;
+    _waker = other._waker;
+  }
+
+  async::future::Result<void> poll(async::future::Context ctx) {
+    std::lock_guard<std::mutex> guard(_m);
+    if (_timer_finished) {
+      return async::future::Ready<void>();
+    } else {
+      _waker = ctx.waker;
+
+      return async::future::Pending{};
+    }
+  }
+
+private:
+  std::mutex _m;
+  bool _timer_finished;
+  async::future::WakerFn _waker;
+};
+
+void test_basic() {
+  using namespace async;
+
+  async::executor::LocalExecutor exec;
+  exec.block_on(OneSecondTimer());
+}
+
+};
+
 }; // ns tests
 
-using namespace async::future;
-class MyFuture1 : public Future<int> {
-public:
-  Result<int> poll(Context ctx) {
-    return Pending{};
-  }
-};
-
-class MyFuture2 : public Future<int> {
-public:
-  Result<int> poll(Context ctx) {
-    MyFuture1 f;
-    AWAIT(f, ctx);
-
-    return Pending{};
-  }
-};
-
 int main() {
-  MyFuture1 f;
-  async::task::Task t(f);
-  tests::selector::test_pipe();
+  tests::executor::test_basic();
 }

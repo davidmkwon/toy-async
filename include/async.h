@@ -12,7 +12,6 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
-
 #include <errno.h>
 #include <string.h>
 #include <sys/event.h>
@@ -39,9 +38,13 @@ private:
 ///
 namespace selector {
 
-// Attached to `kevent`s to identify them
+// An identifier for an Event. Embedded within underlying kevent structure
 struct Token {
   std::size_t id;
+
+  bool operator==(const Token &other) const {
+    return id == other.id;
+  }
 };
 
 // Express read/write interest on a file descriptor
@@ -209,12 +212,6 @@ struct std::hash<async::selector::Token> {
   }
 };
 
-// make selector::Token equalable
-inline bool operator==(const async::selector::Token &lhs,
-                       const async::selector::Token &rhs) {
-  return lhs.id == rhs.id;
-}
-
 
 ///
 namespace async {
@@ -236,6 +233,10 @@ struct Pending { };
 // Represents the completed value
 template <typename T>
 struct Ready { T val; };
+
+// Empty struct for void return value
+template <>
+struct Ready<void> {};
 
 // Polling a future returns either a pending status or a completed value
 template <typename T>
@@ -268,26 +269,29 @@ namespace task {
 
 class _Core {
 public:
-  virtual void poll(future::Context ctx) = 0;
+  virtual bool poll(future::Context ctx) = 0;
 };
 
 /// Holds the underlying future. This class is type-erased and held behind a generic
 /// pointer, so operations to the underlying future are executed through this interface
 ///
 /// Kind of acts as a vtable
+//template <class F, class = typename std::enable_if_t<!std::is_lvalue_reference_v<F>>>
 template <class F>
 class Core : public _Core {
 public:
-  Core(F fut) : _fut(fut) { }
+  Core(F &&fut) : _fut(std::move(fut)) { }
 
-  void poll(future::Context ctx) {
+  bool poll(future::Context ctx) {
     auto res = _fut.poll(ctx);
 
     // if future has completed
     if (res.index() == 0) {
+      return true;
     }
     // if future is still pending
     else {
+      return false;
     }
   }
 
@@ -310,22 +314,23 @@ public:
   // advantage of having a dedicated class is that there can be multiple methods (more
   // than just poll)
 
-  // Create a task from a future.
+  // Create a task from a future
   //
   // The passed in future must inherit from future::Future. Task holds onto a pointer to
   // the Core wrapping the future.
+  //template <class F, class = typename std::enable_if_t<!std::is_lvalue_reference_v<F>>>
   template <class F>
-  Task(F fut) {
+  Task(F &&fut) {
     // ensure that F is a future
     static_assert(std::is_base_of_v<future::Future<typename F::Output>, F>);
 
-    Core<F> *c = new Core(fut);
+    Core<F> *c = new Core(std::move(fut));
     _core_ptr = (void *)c;
   }
 
-  // Polls underlying future
-  void poll(future::Context ctx) {
-    ((_Core *)_core_ptr)->poll(ctx);
+  // Polls underlying future, returning whether is it ready
+  bool poll(future::Context ctx) {
+    return ((_Core *)_core_ptr)->poll(ctx);
   }
 
 private:
@@ -339,22 +344,6 @@ private:
 ///
 namespace executor {
 
-// Maintains state on the wakers for a given event source
-class ScheduledIo {
-public:
-  void add() {}
-
-  // Loops through the wakers, only waking those with the given interest
-  void wake(selector::Interest interest) {
-  }
-
-private:
-  // TODO: you need to add more information besides just the waker, for example the
-  // interest this waker is for (read or write), because there can be multiple tasks
-  // waiting on a source but for different readiness events
-  std::vector<future::Context> _wakers;
-};
-
 // Responsible for monitoring IO events and waking the respective tasks
 class IODriver {
 public:
@@ -367,9 +356,8 @@ public:
     for (auto i = 0u; i < num_events; i++) {
       // call the waker associated with this event
       auto tok = _events.events[i].get_token();
-      auto interest = _events.events[i].get_interest();
       if (_resources.find(tok) != _resources.end()) {
-        _resources[tok].wake(interest);
+        _resources[tok].waker();
       }
     }
   }
@@ -381,27 +369,26 @@ private:
   // The Poll to monitor I/O events
   selector::Poll _p;
 
-  // Map from tokens to wakers
-  std::unordered_map<selector::Token, ScheduledIo> _resources;
+  // Map from tokens to contexts
+  std::unordered_map<selector::Token, future::Context> _resources;
 };
 
 // The executor is responsible for driving all the tasks and futures to completion. It can
 // be run on both a single threaded or multiple threads
-//
-// CURRENTLY SINGLE THREAD IMPLEMENTATION
-class Executor {
+class LocalExecutor {
 public:
   // Create the executor
-  Executor() { }
+  LocalExecutor() { }
 
   // Begin the executor, running the given future until completion
   template <class F>
-  void block_on(F fut) {
+  void block_on(F &&fut) {
     // ensure that F is a future
     static_assert(std::is_base_of_v<future::Future<typename F::Output>, F>);
 
-    // create and push task from this future
-    _tq.push_back(std::make_shared(fut));
+    // create and push task for this future
+    std::shared_ptr<task::Task> ptr(new task::Task(std::move(fut)));
+    _tq.push_back(ptr);
 
     // drive tasks to completion, polling on them
     run();
@@ -409,7 +396,14 @@ public:
 
   // Run event loop, driving tasks to completion
   void run() {
-    while (!_tq.empty()) {
+    bool keep_running = true;
+
+    // TODO: this can't be the loop condition. because the queue might be empty but there
+    // might be events that cause tasks to be added back to the queue later, but if the
+    // loop stops right away then those tasks never get processed. can't entirely rely on
+    // IO driver either because in the case of a timer, it's another thread that will call
+    // the waker, and this thread isn't going to be processed as an IO event
+    while (keep_running) {
       // take next task and poll it
       auto t = _tq.front(); _tq.pop_front();
 
@@ -418,7 +412,13 @@ public:
         _tq.push_back(t);
       };
 
-      t->poll(future::Context { waker });
+      // poll this task
+      bool is_ready = t->poll(future::Context { waker });
+
+      // run an iteration of the IO driver
+      _io_driver.turn(std::chrono::nanoseconds(1000));
+
+      // continue looping?
     }
   }
 
@@ -461,6 +461,13 @@ private:
 
 }; // ns selector
 
+//
+namespace sources {
+
+
+
+}; // ns sources
+
 }; // ns async
 
 
@@ -483,6 +490,3 @@ private:
     return async::future::Pending{}; \
   } \
 }
-
-// TODO: figure out thread parking/unparking (probs need to do something based on
-// conditional variables?)
