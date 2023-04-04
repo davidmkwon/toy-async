@@ -24,12 +24,17 @@ if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 endif()
 
 # add header/sources
-file(GLOB_RECURSE headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h")
+file(GLOB_RECURSE async_headers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/async.h")
 
 # create async library
 add_library(${PROJECT_NAME} INTERFACE)
 target_include_directories(${PROJECT_NAME} INTERFACE include)
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+
+# create cyan library
+add_library(cyan INTERFACE)
+target_include_directories(cyan INTERFACE include)
+set_target_properties(cyan PROPERTIES LINKER_LANGUAGE CXX)
 
 #target_include_directories(
 #  ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
