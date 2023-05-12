@@ -1,4 +1,5 @@
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -27,13 +28,16 @@ private:
   class Worker {
   public:
     // an empty worker, with the thread doing nothing
-    Worker(std::size_t id) : _keep_running(true), _id(id) { }
+    Worker(std::size_t id) : _keep_running(true), _id(id) {
+      //std::cout << "worker " << _id << " initialized: " << _keep_running.load() << std::endl;
+    }
 
     // move constructs a worker, taking ownership of the underlying thread
     Worker(Worker &&other) {
       _keep_running = other._keep_running.load();
       _t = std::move(other._t);
       _id = other._id;
+      //std::cout << "worker " << _id << " moved: " << _keep_running.load() << std::endl;
     }
 
     // safety of holding a reference to exec--Executor, upon destruction, calls the
@@ -43,30 +47,30 @@ private:
       _t = std::thread([&](std::size_t _id) {
           Executor::Token tok;
           Handler handler;
+          std::cout << (_keep_running.load() ? "true" : "false") << std::endl;
 
           // check kill signal
           while (_keep_running.load()) {
-            // check if there is work to do
-            exec._wqm.lock();
-            if (!exec._wq.empty()) {
-              // pop off the next token and free the lock
-              tok = exec._wq.front();
-              std::cout << "Worker " << _id << " processing tok " << tok << std::endl;
-              exec._wq.pop_front();
-              exec._wqm.unlock();
+            //std::cout << "worker " << _id << " started " << std::endl;
+            // wait until the cond var is notified about work to do
+            std::unique_lock<std::mutex> wql(exec._wqm);
+            exec._work_cv.wait(wql, [&]{ return !exec._wq.empty(); });
 
-              // get read handle to handler map and call handler
-              exec._hsm.lock_shared();
-              handler = exec._handlers[tok];
-              exec._hsm.unlock_shared();
+            // we now have the lock acquired and take the next task off the queue
+            // check that the cv condition actually ran--that is, the work queue actually has work
+            assert(!exec._wq.empty());
+            tok = exec._wq.front();
+            std::cout << "Worker " << _id << " processing tok " << tok << std::endl;
+            exec._wq.pop_front();
+            wql.unlock();
 
-              // call handler
-              handler();
-            }
-            // don't forget to free the lock :D
-            else {
-              exec._wqm.unlock();
-            }
+            // get read handle to handler map and call handler
+            exec._hsm.lock_shared();
+            handler = exec._handlers[tok];
+            exec._hsm.unlock_shared();
+
+            // call handler
+            handler();
           }
       }, _id);
     }
@@ -80,6 +84,7 @@ private:
     }
 
     ~Worker() {
+      //std::cout << "worker " << _id << " destroyed" << std::endl;
       stop();
     }
 
@@ -136,6 +141,8 @@ public:
     for (std::size_t i = 0; i < 2; i++) {
       _workers.push_back(Worker(i));
       std::cout << _workers[i]._id << std::endl;
+    }
+    for (std::size_t i = 0; i < 2; i++) {
       _workers[i].start(*this);
     }
 
@@ -174,8 +181,9 @@ private:
   // probs cud add it to a shared worker queue? idk if you should add the token
   // or the handler function itself to the queue
   void dispatch(Token tok) {
-    std::lock_guard<std::mutex> guard(_wqm);
+    std::lock_guard<std::mutex> wql(_wqm);
     _wq.push_back(tok);
+    _work_cv.notify_one();
   }
 
 private:
@@ -189,6 +197,7 @@ private:
   // task queue for workers
   std::deque<Token> _wq;
   std::mutex _wqm;
+  std::condition_variable _work_cv;
 
   // holds worker handles
   std::vector<Worker> _workers;
